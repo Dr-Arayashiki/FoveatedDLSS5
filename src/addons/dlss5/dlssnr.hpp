@@ -1242,6 +1242,8 @@ inline constexpr uint32_t kStackPasses = 1;
 inline constexpr bool kChainedHistory = true;
 inline constexpr uint32_t kPreset = 0;
 inline constexpr uint32_t kStyle = 0;
+// DLSSNR.MaskBlendMode (310.9.16+): 0 = runtime default, 1/2 = alternate blends.
+inline constexpr uint32_t kMaskBlendMode = 0;
 inline constexpr float kIntensity = 1.f;
 inline constexpr float kLocalTone = 1.f;
 inline constexpr float kLocalStructure = 1.f;
@@ -1439,6 +1441,7 @@ inline void RequestHistoryReset(
 }
 inline std::atomic_uint64_t configuration_generation = 1;
 inline std::atomic_uint32_t preset = defaults::kPreset;
+inline std::atomic_uint32_t mask_blend_mode = defaults::kMaskBlendMode;
 inline std::atomic<float> intensity = defaults::kIntensity;
 inline std::atomic_uint32_t style = defaults::kStyle;
 inline std::atomic<float> local_tone_strength = defaults::kLocalTone;
@@ -5061,6 +5064,10 @@ inline bool EnsureNrFeature(
       reinterpret_cast<void*>(&DlssNrScalingRatioCallback));
   NVSDK_NGX_Parameter_SetUI(
       parameters, "DLSSNR.Hint.Render.Preset", preset.load());
+  // 310.9.16+: which neural-mask blend the feature is built with.  Changing it
+  // recreates the feature (same effect as NRPreset).
+  NVSDK_NGX_Parameter_SetUI(
+      parameters, "DLSSNR.MaskBlendMode", mask_blend_mode.load());
   // Control creates the native-resolution NR pass with default quality, independent
   // of the game's DLSS SR quality mode.
   NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_PerfQualityValue, 0);
@@ -5344,6 +5351,8 @@ inline void SetEvaluationParameters(
   NVSDK_NGX_Parameter_SetI(parameters, "DLSSNR.UseAutoMask", model_auto_mask ? 1 : 0);
   NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.Style", model_style);
   NVSDK_NGX_Parameter_SetI(parameters, "DLSSNR.UICorrection", model_ui_correction ? 1 : 0);
+  NVSDK_NGX_Parameter_SetUI(
+      parameters, "DLSSNR.MaskBlendMode", mask_blend_mode.load());
   // Observe-only: a slot's steering when it first goes out and whenever it
   // changes, so a support log can tell what each stack pass asked the model
   // for (a pass whose "Same as pass 1" is off sends its own).  At most one
@@ -15261,6 +15270,9 @@ inline constexpr Setting kSetIntensity{
 
 inline constexpr Setting kSetPreset{
     "NRPreset", &preset, defaults::kPreset, SettingEffect::kRecreate};
+inline constexpr Setting kSetMaskBlendMode{
+    "NRMaskBlendMode", &mask_blend_mode, defaults::kMaskBlendMode,
+    SettingEffect::kRecreate};
 inline constexpr Setting kSetStyle{
     "NRStyle", &style, defaults::kStyle, SettingEffect::kHistory};
 inline constexpr Setting kSetLocalTone{
@@ -15562,7 +15574,7 @@ using SettingGroup = std::span<const Setting* const>;
 inline constexpr const Setting* kCoreSettings[] = {&kSetEnabled};
 inline constexpr const Setting* kStrengthSettings[] = {&kSetIntensity};
 inline constexpr const Setting* kLookSettings[] = {
-    &kSetPreset,         &kSetStyle,         &kSetLocalTone,
+    &kSetPreset,         &kSetMaskBlendMode, &kSetStyle,         &kSetLocalTone,
     &kSetLocalStructure, &kSetSkinStructure, &kSetSkinIndependent,
     &kSetAutoMask,       &kSetUiCorrection};
 inline constexpr const Setting* kLookResultSettings[] = {
@@ -15968,13 +15980,24 @@ inline void DrawModelSteering(const ui::PanelText& text, uint32_t pass) {
 // the classic layout keeps them under its collapsed "Model styling
 // (advanced)".
 inline void DrawSectionModelStyling(const ui::PanelText& text) {
-  if (text.modern) ui::SubCaption(ui::text::kLookModel);
+  // Separate from Style (Default/Natural/Cinematic): this picks which neural
+  // network the 310.9.16 runtime runs — legacy 310.8 vs the newer FP8 model.
+  if (text.modern) ui::SubCaption(ui::text::kDlss5Model);
   constexpr const char* kPresets[] = {
-      "Default", "Preset #1", "Preset #2", "Preset #3"};
+      "Default (Auto / 310.9.16 FP8)", "Preset A (Legacy 310.8)",
+      "Preset B (Fast FP8)", "Preset C (Low Latency)"};
   ChoiceSetting(
-      text, kSetPreset, text.Pick("NR Preset", "Preset"), kPresets,
-      "Render-preset hint passed to the NR runtime; Default lets the"
-      " runtime choose.");
+      text, kSetPreset, text.Pick("NR Preset", "Neural model"), kPresets,
+      "Which neural model the 310.9.16 runtime uses.  Default and Preset B"
+      " are the newer faster FP8 model (up to ~40% less NR cost); Preset A"
+      " is the older 310.8 look.  A change recreates the NR feature.");
+  constexpr const char* kMaskBlend[] = {
+      "Default (Auto)", "Mode 1 (Alternative)", "Mode 2 (Smooth)"};
+  ChoiceSetting(
+      text, kSetMaskBlendMode, "Mask blend mode", kMaskBlend,
+      "DLSS 5 310.9.16 parameter (DLSSNR.MaskBlendMode).  Controls how the"
+      " neural mask blends with the frame.  Needs nvngx_dlssnr.dll 310.9.16+.");
+  if (text.modern) ui::SubCaption(ui::text::kLookModel);
   DrawModelSteering(text, 0);
 }
 
@@ -17864,6 +17887,7 @@ inline void LoadConfiguration() {
   uint32_t saved_codec_mode = defaults::kCodecMode;
   float saved_anchor = defaults::kProxyAnchorNits;
   uint32_t saved_preset = defaults::kPreset;
+  uint32_t saved_mask_blend = defaults::kMaskBlendMode;
   uint32_t saved_style = defaults::kStyle;
   float saved_intensity = defaults::kIntensity;
   float saved_local_tone = defaults::kLocalTone;
@@ -17932,6 +17956,8 @@ inline void LoadConfiguration() {
       nullptr, kConfigSection, "NRCodecMode", saved_codec_mode);
   reshade::get_config_value(nullptr, kConfigSection, "NRProxyAnchor", saved_anchor);
   reshade::get_config_value(nullptr, kConfigSection, "NRPreset", saved_preset);
+  reshade::get_config_value(
+      nullptr, kConfigSection, "NRMaskBlendMode", saved_mask_blend);
   reshade::get_config_value(nullptr, kConfigSection, "NRStyle", saved_style);
   reshade::get_config_value(nullptr, kConfigSection, "NRIntensity", saved_intensity);
   reshade::get_config_value(nullptr, kConfigSection, "NRLocalTone", saved_local_tone);
@@ -18490,6 +18516,8 @@ inline void LoadConfiguration() {
   proxy_anchor_nits = SanitizeFloatKey(
       saved_anchor, defaults::kProxyAnchorNits, 0.5f, 32.f, "NRProxyAnchor");
   preset = SanitizeEnumKey(saved_preset, defaults::kPreset, 0u, 3u, "NRPreset");
+  mask_blend_mode = SanitizeEnumKey(
+      saved_mask_blend, defaults::kMaskBlendMode, 0u, 2u, "NRMaskBlendMode");
   style = SanitizeEnumKey(saved_style, defaults::kStyle, 0u, 2u, "NRStyle");
   intensity = SanitizeFloatKey(
       saved_intensity, defaults::kIntensity, 0.f, 2.f, "NRIntensity");

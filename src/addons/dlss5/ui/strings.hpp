@@ -135,6 +135,10 @@ inline constexpr const char* kDefaultsViewNote =
 inline constexpr const char* kResolution = "Resolution";
 inline constexpr const char* kLook = "LOOK";
 inline constexpr const char* kResetLook = "Reset look";
+// Neural-network choice inside nvngx_dlssnr.dll 310.9.16 (Hint.Render.Preset
+// + MaskBlendMode).  Separate from Style (Default / Natural / Cinematic).
+inline constexpr const char* kDlss5Model =
+    "DLSS 5 model \xc2\xb7 310.9.16 runtime";
 // The LOOK's two groups (v7.1, PLAN_NR_LOOK_V71.md): the model's own
 // controls, which restart its history, and the look stage's, which reshape
 // what it returned, live.  "\xc2\xb7" is U+00B7, a middle dot.
