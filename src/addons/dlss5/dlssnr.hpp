@@ -16148,24 +16148,29 @@ inline void ResolutionResetButton(const char* id) {
   }
 }
 
+// NR insertion point.  After (default): NR runs on the game's finished DLSS
+// output at display resolution.  Before (pre-SR): NR runs on the game's DLSS
+// INPUT at render resolution against the game's own depth/motion guides.
+inline void DrawInsertionPoint(const ui::PanelText& text) {
+  if (text.modern) {
+    constexpr const char* kPoints[] = {"After upscaling", "Before upscaling"};
+    ChoiceSetting(
+        text, kSetPreSr, text.pre_sr, kPoints,
+        "Where Neural Rendering runs: after the game's finished DLSS image,"
+        " or before DLSS upscales (pre-SR), against the game's own depth and"
+        " motion.  Pre-SR fits games whose DLSS renders below the display"
+        " resolution.  Ray Reconstruction keeps the after path: its input is"
+        " still noisy.");
+  } else {
+    ToggleSetting(
+        text, kSetPreSr, text.pre_sr,
+        nullptr);
+  }
+}
+
 inline void DrawSectionStackingResolution(const ui::PanelText& text) {
-  // NR insertion point.  After (default): NR runs on the game's finished DLSS
-  // output at display resolution - correct whenever the game feeds DLSS a
-  // display-res color.  Before (pre-SR): NR runs on the game's DLSS INPUT
-  // color at render resolution against the game's own depth/motion guides, so
-  // color and guides share a resolution by construction; the game's DLSS then
-  // upscales an already-enhanced image.  For render-resolution DLSS titles
-  // (e.g. KCD2: 1440p color in, 4K out, 1440p guides) pre-SR is the in-spec
-  // arrangement; the after path is out of contract there.
-  ToggleSetting(
-      text, kSetPreSr, text.pre_sr,
-      text.modern ? "Runs Neural Rendering on the game's image before DLSS"
-                    " upscales it (pre-SR), against the game's own depth and"
-                    " motion.  The right choice for games whose DLSS renders"
-                    " below the display resolution.  Games that upscale with"
-                    " Ray Reconstruction keep running after it: its input is"
-                    " still noisy."
-                  : nullptr);
+  // Modern layout draws Insertion point next to Resolution (always visible).
+  if (!text.modern) DrawInsertionPoint(text);
 
   // NR stacking (v5.0.1): chained feature-18 passes.  Pass 1 IS the global
   // sliders above (and the existing config keys) and carries the model's
@@ -17443,6 +17448,9 @@ inline void DrawModernLayout(reshade::api::effect_runtime* runtime,
     ui::RowLabel("");
     ImGui::TextDisabled(ui::Tr(ui::text::kCustomResolution), scale * 100.f);
   }
+
+  // Same place as the older "Imagem" panel: always visible, not under Performance.
+  DrawInsertionPoint(text);
 
   // A section's reset link is hidden in the Defaults view: the look is
   // stock then, and the player's own values come back with Mine.

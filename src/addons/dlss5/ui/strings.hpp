@@ -71,7 +71,7 @@ inline constexpr PanelText kModernText = {
     true,
     "Neural Rendering",
     "Strength",
-    "Before upscaling",
+    "Insertion point",
     "Stack passes",
     "HDR mode",
     "Paper white (nits)",
