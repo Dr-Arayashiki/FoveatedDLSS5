@@ -1,7 +1,7 @@
-// Foveated NR guides: resamples the game's depth and motion vectors onto the
-// warped working grid (foveation.hlsli), so DLSSNR's guides stay registered
-// with the warped colour it is given.  Runs once per evaluate, before the
-// stack; every stack pass reads the same pair.
+// Working-grid NR guides: resamples the game's depth and motion onto the NR
+// working grid (uniform resize and/or foveated warp), so Color/Depth/MVec
+// stay registered.  Also removes sub-pixel jitter from MVJittered vectors
+// (NR has no jitter key to correct them itself).
 //
 // Bound with the codec root signature: t0 = game depth, t1 = game motion
 // (t2/t3 repeat them), u0 = warped motion, u1 = warped depth.  The runtime
@@ -32,8 +32,10 @@ cbuffer FovGuideConstants : register(b0) {
   uint2 DepthBase;     // depth subrect origin
   float2 MotionScale;  // game MVecScale x the player's multiplier
   uint Flags;          // bit 0: depth bound, bit 1: motion bound
-  uint Reserved0;      // scalars, not uint3: identical offsets under every packing rule
-  uint Reserved1;
+  // Jitter delta in motion-grid pixels (current - previous).  Subtracted
+  // from MV*scale when the game flagged MVJittered; zero otherwise.
+  float JitterDeltaX;
+  float JitterDeltaY;
   uint Reserved2;
   uint4 Reserved3;
   uint4 Reserved4;
@@ -66,7 +68,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   if ((Flags & kFlagMotion) != 0u) {
     const uint2 grid = max(MotionGrid, uint2(1, 1));
     const uint2 texel = MotionBase + min(uint2(saturate(n) * float2(grid)), grid - 1u);
-    const float2 mv = GuideMotion.Load(int3(texel, 0)) * MotionScale;
+    const float2 mv = GuideMotion.Load(int3(texel, 0)) * MotionScale
+        - float2(JitterDeltaX, JitterDeltaY);
     // Normalized displacement on the full frame, then through the warp.
     // The current position's warp is the texel centre by construction.
     const float2 d = mv / float2(grid);

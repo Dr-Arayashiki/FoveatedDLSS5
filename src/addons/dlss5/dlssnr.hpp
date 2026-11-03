@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -312,6 +312,10 @@ struct FeatureState {
   float jitter_x = 0.f;
   float jitter_y = 0.f;
   bool has_jitter = false;
+  // Previous frame's jitter for unjittering MVJittered guides (NR cannot).
+  float prev_guide_jitter_x = 0.f;
+  float prev_guide_jitter_y = 0.f;
+  bool guide_jitter_valid = false;
   int32_t perf_quality = 0;
   int32_t frame_reset = 0;
   // Engine-managed exposure contract: the game supplies an ExposureTexture,
@@ -2435,19 +2439,82 @@ inline const std::filesystem::path& ReShadeBaseDirectory() {
 // ReShade setups with a central AddonPath load the addon far from the game
 // while the runtime sits beside the exe.  Field logs showed exactly that
 // class failing with "dll was not found beside the addon".
-inline std::filesystem::path FindNrRuntimePath() {
-  const std::filesystem::path primary = AddonDirectory() / L"nvngx_dlssnr.dll";
-  std::error_code ignored;
-  if (std::filesystem::exists(primary, ignored)) return primary;
+struct AvailableNrDll {
+  std::wstring filename;
+  std::string display_name;
+  std::filesystem::path full_path;
+};
+
+inline std::vector<AvailableNrDll> ScanAvailableNrDlls() {
+  std::vector<AvailableNrDll> list;
+  std::vector<std::filesystem::path> search_dirs;
+  search_dirs.push_back(AddonDirectory());
+
   std::wstring exe(32768, L'\0');
   const DWORD length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
   if (length != 0 && length < exe.size()) {
     exe.resize(length);
-    const std::filesystem::path fallback =
-        std::filesystem::path(exe).parent_path() / L"nvngx_dlssnr.dll";
-    if (std::filesystem::exists(fallback, ignored)) return fallback;
+    search_dirs.push_back(std::filesystem::path(exe).parent_path());
   }
-  return primary;
+
+  std::unordered_set<std::wstring> seen;
+  for (const auto& dir : search_dirs) {
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) continue;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (entry.is_regular_file()) {
+        std::wstring fname = entry.path().filename().wstring();
+        std::wstring lower_name = fname;
+        for (auto& c : lower_name) c = static_cast<wchar_t>(towlower(c));
+        if (lower_name.rfind(L"nvngx_dlssnr", 0) == 0 && entry.path().extension() == L".dll") {
+          if (seen.insert(lower_name).second) {
+            std::string name_u8 = entry.path().filename().string();
+            list.push_back({fname, name_u8, entry.path()});
+          }
+        }
+      }
+    }
+  }
+  if (list.empty()) {
+    list.push_back({L"nvngx_dlssnr.dll", "nvngx_dlssnr.dll", AddonDirectory() / L"nvngx_dlssnr.dll"});
+  }
+  return list;
+}
+
+inline std::filesystem::path FindNrRuntimePath() {
+  char saved_dll[260] = "";
+  size_t size = sizeof(saved_dll);
+  reshade::get_config_value(nullptr, kConfigSection, "SelectedNrDll", saved_dll, &size);
+
+  std::wstring chosen_filename;
+  if (saved_dll[0] != '\0') {
+    chosen_filename = std::filesystem::path(saved_dll).wstring();
+
+  } else {
+    chosen_filename = L"nvngx_dlssnr.dll";
+  }
+
+  std::vector<std::filesystem::path> search_dirs;
+  search_dirs.push_back(AddonDirectory());
+  std::wstring exe(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+  if (length != 0 && length < exe.size()) {
+    exe.resize(length);
+    search_dirs.push_back(std::filesystem::path(exe).parent_path());
+  }
+
+  std::error_code ignored;
+  for (const auto& dir : search_dirs) {
+    const std::filesystem::path candidate = dir / chosen_filename;
+    if (std::filesystem::exists(candidate, ignored)) return candidate;
+  }
+
+  for (const auto& dir : search_dirs) {
+    const std::filesystem::path def = dir / L"nvngx_dlssnr.dll";
+    if (std::filesystem::exists(def, ignored)) return def;
+  }
+
+  return AddonDirectory() / L"nvngx_dlssnr.dll";
 }
 
 // Cached by path, size and write time (v7.0.0-rc10): a device-rebuild
@@ -5084,7 +5151,12 @@ inline bool EnsureNrFeature(
   // measured live, F8) can be read.  A future runtime that names "Exposure" makes this a live contract
   // again, and feed v2 would then have to stop sending AutoExposure (F7).
   const bool forced_contract = resources.hdr_mode != 0;
-  uint32_t nr_create_flags = state.create_flags;
+  // NR has no jitter key to correct MVJittered vectors (guide contract
+  // note).  Strip the flag; RecordWorkingGuides removes the jitter from the
+  // remeshed motion when the game set it.
+  uint32_t nr_create_flags =
+      state.create_flags & ~static_cast<uint32_t>(
+          NVSDK_NGX_DLSS_Feature_Flags_MVJittered);
   if (forced_contract) {
     nr_create_flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR
                     | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -5244,11 +5316,14 @@ inline void SetEvaluationParameters(
   NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.ScalingRatio", 1.f);
   NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.Scale", 1.f);
   // Keep the HDR feature contract identical at create and evaluate time.
+  // MVJittered stays cleared: guides are unjittered when remeshed.
   if (resources.hdr_mode != 0) {
     NVSDK_NGX_Parameter_SetI(
         parameters,
         NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
-        static_cast<int32_t>(state.create_flags
+        static_cast<int32_t>(
+            (state.create_flags
+                & ~static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVJittered))
             | NVSDK_NGX_DLSS_Feature_Flags_IsHDR
             | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure));
     NVSDK_NGX_Parameter_SetF(
@@ -5267,9 +5342,9 @@ inline void SetEvaluationParameters(
       parameters,
       "DLSSNR.MVecScaleY",
       frame.motion_scale_y * motion_scale_y_multiplier.load());
-  if (resources.foveation.active() && resources.fov_guides_valid) {
-    // Foveated grid (RecordFoveatedGuides): the guides are already on the
-    // warped working grid, 1:1 with Color, and the vectors are in its pixels.
+  if (resources.fov_guides_valid) {
+    // Working-grid guides (RecordWorkingGuides): depth/motion already match
+    // Color 1:1; vectors are in working-grid pixels (scale baked in).
     parameters->Set("DLSSNR.MVec", resources.fov_motion);
     parameters->Set("DLSSNR.Depth", resources.fov_depth);
     NVSDK_NGX_Parameter_SetUI(parameters, "DLSSNR.DepthSubrectBaseX", 0);
@@ -5283,17 +5358,23 @@ inline void SetEvaluationParameters(
     NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.MVecScaleX", 1.f);
     NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.MVecScaleY", 1.f);
   }
-  // Jitter is forwarded only when the game actually supplied one this frame:
-  // presence, not value - an absent jitter stays unset rather than pinned to
-  // zero (Streamline carries it per frame via Constants; native NGX titles
-  // set Jitter_Offset_X/Y on the evaluate block when they jitter at all).
-  // Unknown-name tolerance is the runtime's documented behavior.  Runtime
-  // 310.8 names no jitter key at all (see EnsureNrFeature's contract note),
-  // so on the after path, whose input DLSS already de-jittered, it cannot
-  // misplace the image.
+  // Jitter is forwarded only when the game actually supplied one this frame.
+  // Values are in pixels of the Color grid NR sees (working size).  Game
+  // jitter is in render/guide pixels - scale when working differs.  Runtime
+  // 310.8 may ignore the keys; remeshed guides still unjitter MVs themselves.
   if (frame.has_jitter) {
-    NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.JitterOffsetX", frame.jitter_x);
-    NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.JitterOffsetY", frame.jitter_y);
+    float jitter_x = frame.jitter_x;
+    float jitter_y = frame.jitter_y;
+    if (frame.input_width != 0 && frame.input_height != 0
+        && (input_width != frame.input_width
+            || input_height != frame.input_height)) {
+      jitter_x *= static_cast<float>(input_width)
+          / static_cast<float>(frame.input_width);
+      jitter_y *= static_cast<float>(input_height)
+          / static_cast<float>(frame.input_height);
+    }
+    NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.JitterOffsetX", jitter_x);
+    NVSDK_NGX_Parameter_SetF(parameters, "DLSSNR.JitterOffsetY", jitter_y);
   }
   bool depth_inverted =
       (frame.create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
@@ -5314,13 +5395,23 @@ inline void SetEvaluationParameters(
   // this frame, or when it was freshly created (pending_reset).  With
   // NRChainedHistory off (legacy diagnostic stacking), passes 2+ are still
   // deliberately stateless - reset on every frame.
-  const bool do_reset = StackSlotNeedsReset(
-      chained_temporal_history.load(),
-      slot_index,
-      slot.pending_reset,
-      frame.frame_reset,
-      slot.acknowledged_reset_epoch,
-      chain_reset_epoch);
+  //
+  // Pre-SR at a reduced working size: also reset every frame.  The input is
+  // still camera-jittered and history across a smaller grid pulsed the
+  // whole image dark then light; stateless keeps the cheap resolution
+  // without that pulse.
+  const bool pre_sr_scaled =
+      resources.pre_sr_source != nullptr
+      && frame.input_width != 0 && frame.input_height != 0
+      && (input_width != frame.input_width || input_height != frame.input_height);
+  const bool do_reset = pre_sr_scaled
+      || StackSlotNeedsReset(
+          chained_temporal_history.load(),
+          slot_index,
+          slot.pending_reset,
+          frame.frame_reset,
+          slot.acknowledged_reset_epoch,
+          chain_reset_epoch);
   slot.pending_reset = false;
   slot.acknowledged_reset_epoch = chain_reset_epoch;
   NVSDK_NGX_Parameter_SetI(parameters, "DLSSNR.Reset", do_reset ? 1 : 0);
@@ -6270,13 +6361,15 @@ inline void SetSourceView(
 }
 
 // ---------------------------------------------------------------------------
-// Foveated NR guides (foveation.hpp, shaders/fov_guides.cs_5_1.hlsl).
+// Working-grid NR guides (shaders/fov_guides.cs_5_1.hlsl).
 //
-// DLSSNR maps the depth/MVec subrects it is given uniformly onto its own grid.
-// On a warped working grid that would misplace the guides by hundreds of
-// pixels toward the sides, so a foveated frame hands NR its own depth and
-// motion, resampled onto the warped grid (MVecScale 1, subrects = the working
-// surface).  One dispatch per evaluate, shared by every stack pass.
+// Color runs at the NR working size.  Depth/motion from the game stay at the
+// guide (render) size unless remeshed here.  When the working size differs
+// from the guides - resolution scale below 100%, or a warped grid - this
+// pass resamples depth and motion onto the working surface so NR always
+// sees Color, Depth and MVec 1:1 (MVecScale 1).  With the warp off the same
+// shader is a uniform resize.  One dispatch per evaluate, shared by every
+// stack pass.
 
 // SRV format for a game depth buffer (depth formats are typeless or
 // depth-only; the view must name the readable channel).
@@ -6423,7 +6516,8 @@ struct FovGuideConstants {
   uint32_t depth_base[2];
   float motion_scale[2];
   uint32_t flags;
-  uint32_t reserved[11];
+  float jitter_delta[2];
+  uint32_t reserved[9];
   uint32_t foveation[2];
   float foveation_gmax[2];
 };
@@ -6433,15 +6527,27 @@ static_assert(offsetof(FovGuideConstants, foveation)
                   == kCodecFoveationDword * sizeof(uint32_t),
               "the foveated grid starts at dword 24 in every codec view");
 
-// Records the guide resample for this evaluate.  Leaves the pair in
-// NON_PIXEL_SHADER_RESOURCE for NR.  False = hand NR the game's guides (the
-// frame still runs, warped colour against unwarped guides, logged once).
-inline bool RecordFoveatedGuides(
-    ID3D12GraphicsCommandList* command_list, ID3D12Device* device, FinalResources& res,
-    const EvaluationContract& frame) {
-  if (!res.foveation.active() || frame.depth == nullptr || frame.motion == nullptr) {
-    return false;
+// True when Color is not already 1:1 with the game's depth/motion guides, when
+// the working grid is warped, or when MVJittered vectors need unjittering
+// (NR cannot correct them itself).
+inline bool WorkingGuidesNeedRemesh(
+    const FinalResources& res, const EvaluationContract& frame) {
+  if (frame.depth == nullptr || frame.motion == nullptr) return false;
+  if (res.foveation.active()) return true;
+  if (res.input_width != frame.input_width
+      || res.input_height != frame.input_height) {
+    return true;
   }
+  return frame.has_jitter
+      && (frame.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) != 0;
+}
+
+// Records the guide resample for this evaluate.  Leaves the pair in
+// NON_PIXEL_SHADER_RESOURCE for NR.  False = hand NR the game's guides.
+inline bool RecordWorkingGuides(
+    ID3D12GraphicsCommandList* command_list, ID3D12Device* device, FinalResources& res,
+    const EvaluationContract& frame, FeatureState& feature) {
+  if (!WorkingGuidesNeedRemesh(res, frame)) return false;
   // A failed PSO stays failed for the session instead of retrying (and
   // logging) every frame.
   static std::atomic<bool> pso_failed{false};
@@ -6449,7 +6555,7 @@ inline bool RecordFoveatedGuides(
   if (ok && codec_pipeline.fov_guides == nullptr) {
     ok = CreateCodecPipelineState(
         device, __fov_guides, &codec_pipeline.fov_guides,
-        L"DLSS5 Generic foveated guides", "foveated guides");
+        L"DLSS5 Generic working guides", "working guides");
     if (!ok) pso_failed = true;
   }
   ok = ok && EnsureFovGuideSurfaces(device, res);
@@ -6458,13 +6564,16 @@ inline bool RecordFoveatedGuides(
     static std::atomic<bool> logged{false};
     if (!ok && !logged.exchange(true)) {
       Log(reshade::log::level::warning,
-          "foveated NR: guide pass unavailable; running with the game's guides");
+          "NR working guides: guide pass unavailable; running with the game's"
+          " guides (image and motion stay different sizes)");
     }
     return false;
   }
 
   const bool low_res =
       (frame.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
+  const bool mv_jittered =
+      (frame.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) != 0;
   FovGuideConstants constants{};
   constants.size[0] = res.input_width;
   constants.size[1] = res.input_height;
@@ -6480,6 +6589,20 @@ inline bool RecordFoveatedGuides(
   constants.motion_scale[0] = frame.motion_scale_x * motion_scale_x_multiplier.load();
   constants.motion_scale[1] = frame.motion_scale_y * motion_scale_y_multiplier.load();
   constants.flags = 3u;  // depth and motion bound
+  // Unjitter MVJittered vectors (current - previous, in motion-grid pixels).
+  if (mv_jittered && frame.has_jitter) {
+    if (feature.guide_jitter_valid && frame.frame_reset == 0) {
+      constants.jitter_delta[0] =
+          frame.jitter_x - feature.prev_guide_jitter_x;
+      constants.jitter_delta[1] =
+          frame.jitter_y - feature.prev_guide_jitter_y;
+    }
+    feature.prev_guide_jitter_x = frame.jitter_x;
+    feature.prev_guide_jitter_y = frame.jitter_y;
+    feature.guide_jitter_valid = true;
+  } else if (frame.frame_reset != 0) {
+    feature.guide_jitter_valid = false;
+  }
   constants.foveation[0] = res.foveation.x.packed;
   constants.foveation[1] = res.foveation.y.packed;
   constants.foveation_gmax[0] = res.foveation.x.gmax;
@@ -6519,14 +6642,19 @@ inline bool RecordFoveatedGuides(
 
   static std::atomic<bool> logged_active{false};
   if (!logged_active.exchange(true)) {
-    const foveation::Grid& g = res.foveation;
     std::ostringstream message;
-    message << "foveated NR active: working " << res.input_width << 'x' << res.input_height
-            << " for output " << res.width << 'x' << res.height << " (centre "
-            << g.x.center_px << 'x' << g.y.center_px << ", fall-off on screen "
-            << g.x.falloff_px << '/' << g.y.falloff_px << " px, edge density "
-            << g.x.edge_reached << '/' << g.y.edge_reached << ", "
-            << static_cast<int>(std::lround(g.PixelFactor() * 100.0)) << "% of the NR pixels)";
+    message << "NR guides remeshed onto working " << res.input_width << 'x'
+            << res.input_height << " from guide " << frame.input_width << 'x'
+            << frame.input_height;
+    if (res.foveation.active()) {
+      const foveation::Grid& g = res.foveation;
+      message << " (warped centre " << g.x.center_px << 'x' << g.y.center_px
+              << ", "
+              << static_cast<int>(std::lround(g.PixelFactor() * 100.0))
+              << "% of the NR pixels)";
+    } else {
+      message << " (uniform resize so Color/Depth/MVec stay the same size)";
+    }
     Log(reshade::log::level::info, message.str());
   }
   return true;
@@ -6711,44 +6839,62 @@ inline LookRoute RunLookStage(
     bindings.history_out = history.buffers[history.written ^ 1u]->GetGPUVirtualAddress();
     submission::TrackUse(command_list, history.buffers[0]);
     submission::TrackUse(command_list, history.buffers[1]);
-    if (settings.stabilize == 2u && frame.motion != nullptr) {
-      // A write-once view per distinct motion-vector resource: a view is
-      // never rewritten while a recorded list may read it.  A game cycling
-      // more resources than the ring holds runs static on the rest (counted).
+    if (settings.stabilize == 2u
+        && (res.fov_guides_valid ? res.fov_motion != nullptr
+                                 : frame.motion != nullptr)) {
+      // Remeshed guides are already in working-grid pixels (scale 1).  Otherwise
+      // a write-once view per distinct game motion resource: never rewritten
+      // while a recorded list may read it.
+      ID3D12Resource* const motion_source =
+          res.fov_guides_valid ? res.fov_motion : frame.motion;
       uint32_t ring = 0;
       while (ring < kMotionRingSize && res.motion_views[ring] != nullptr
-             && res.motion_views[ring] != frame.motion) {
+             && res.motion_views[ring] != motion_source) {
         ++ring;
       }
       if (ring == kMotionRingSize) {
         look_motion_ring_full.fetch_add(1, std::memory_order_relaxed);
       } else {
         if (res.motion_views[ring] == nullptr) {
-          frame.motion->AddRef();
-          res.motion_views[ring] = frame.motion;
-          SetSourceView(device, res, frame.motion, kDescriptorMotionRing + ring);
+          motion_source->AddRef();
+          res.motion_views[ring] = motion_source;
+          SetSourceView(device, res, motion_source, kDescriptorMotionRing + ring);
         }
-        submission::TrackUse(command_list, frame.motion);
-        // DLSS motion vectors (Programming Guide 3.6): MV * MVecScale is the
-        // displacement to the previous position in pixels of the grid the
-        // vectors are rendered at - the render resolution with MVLowRes,
-        // the output resolution without it.  The history lives on the NR
-        // grid, so the scale carries that ratio and the user multiplier.
-        const bool low_res =
-            (frame.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
-        const uint32_t grid_width = low_res ? frame.input_width : frame.output_width;
-        const uint32_t grid_height = low_res ? frame.input_height : frame.output_height;
-        look_frame.motion = grid_width != 0 && grid_height != 0;
-        look_frame.motion_scale[0] = chain.motion_scale[0]
-            * motion_scale_x_multiplier.load()
-            * static_cast<float>(res.input_width) / static_cast<float>(grid_width);
-        look_frame.motion_scale[1] = chain.motion_scale[1]
-            * motion_scale_y_multiplier.load()
-            * static_cast<float>(res.input_height) / static_cast<float>(grid_height);
-        look_frame.motion_base[0] = frame.motion_x;
-        look_frame.motion_base[1] = frame.motion_y;
-        look_frame.motion_grid[0] = grid_width;
-        look_frame.motion_grid[1] = grid_height;
+        submission::TrackUse(command_list, motion_source);
+        if (res.fov_guides_valid) {
+          look_frame.motion = res.input_width != 0 && res.input_height != 0;
+          look_frame.motion_scale[0] = 1.f;
+          look_frame.motion_scale[1] = 1.f;
+          look_frame.motion_base[0] = 0;
+          look_frame.motion_base[1] = 0;
+          look_frame.motion_grid[0] = res.input_width;
+          look_frame.motion_grid[1] = res.input_height;
+        } else {
+          // DLSS motion vectors (Programming Guide 3.6): MV * MVecScale is the
+          // displacement to the previous position in pixels of the grid the
+          // vectors are rendered at - the render resolution with MVLowRes,
+          // the output resolution without it.  The history lives on the NR
+          // grid, so the scale carries that ratio and the user multiplier.
+          const bool low_res =
+              (frame.create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
+          const uint32_t grid_width =
+              low_res ? frame.input_width : frame.output_width;
+          const uint32_t grid_height =
+              low_res ? frame.input_height : frame.output_height;
+          look_frame.motion = grid_width != 0 && grid_height != 0;
+          look_frame.motion_scale[0] = chain.motion_scale[0]
+              * motion_scale_x_multiplier.load()
+              * static_cast<float>(res.input_width)
+              / static_cast<float>(grid_width);
+          look_frame.motion_scale[1] = chain.motion_scale[1]
+              * motion_scale_y_multiplier.load()
+              * static_cast<float>(res.input_height)
+              / static_cast<float>(grid_height);
+          look_frame.motion_base[0] = frame.motion_x;
+          look_frame.motion_base[1] = frame.motion_y;
+          look_frame.motion_grid[0] = grid_width;
+          look_frame.motion_grid[1] = grid_height;
+        }
         bindings.motion = DescriptorHeapSlot(
             heap_gpu, kDescriptorMotionRing + ring, res.descriptor_size);
       }
@@ -6998,11 +7144,8 @@ inline void LogNrWorkingResolutionReduced(
       "NR working resolution reduced (" + std::to_string(reference_width)
           + "x" + std::to_string(reference_height) + " -> "
           + std::to_string(nr_width) + "x" + std::to_string(nr_height)
-          + "); the decode stage upscales, and NR reads the game's motion"
-            " vectors at their own scale (through rc3 they were shortened by"
-            " the working-res fraction - the likely cause of the pan flicker"
-            " reported below ~85%). Edge-aware upsampling (Look) keeps edges"
-            " sharper at this resolution");
+          + "); decode upscales back, and depth/motion are remeshed onto the"
+            " working size so Color/Depth/MVec stay aligned");
 }
 
 // Runs NR immediately after a successful game DLSS evaluation. This insertion
@@ -7536,21 +7679,22 @@ inline bool ProcessInline(
       current.exposure.scale > 0.f ? current.exposure.scale : 1.f;
   frame.feed = FrameFeed(&feature, current, res, exposure);
 
-  // Foveated working grid: from here every codec and look bind of this
-  // evaluate forwards res.foveation, and NR gets guides warped the same way.
-  // Per axis: an axis the debounce still holds at the full extent runs
-  // uniform this frame (a warp over an unshrunk axis would only cost).
+  // Working grid: every codec/look bind of this evaluate forwards
+  // res.foveation.  When the working size differs from the guides (or the
+  // grid is warped), remesh depth/motion onto the working surface first.
+  // Per axis: an axis still at the full extent runs uniform this frame.
   res.foveation = frame_foveation;
   if (res.input_width >= res.width) res.foveation.x = {};
   if (res.input_height >= res.height) res.foveation.y = {};
-  res.fov_guides_valid = res.foveation.active()
-      && RecordFoveatedGuides(command_list, device, res, frame);
-  if (res.foveation.active() && !res.fov_guides_valid) {
+  res.fov_guides_valid =
+      RecordWorkingGuides(command_list, device, res, frame, feature);
+  if (WorkingGuidesNeedRemesh(res, frame) && !res.fov_guides_valid) {
     static std::atomic<bool> logged_unwarped{false};
     if (!logged_unwarped.exchange(true)) {
       Log(reshade::log::level::warning,
-          "foveated NR: this frame's guides are not warped; edits toward the"
-          " sides may smear until the guide pass runs");
+          "NR working guides: this frame still uses the game's depth/motion"
+          " at their own size; skin/motion edits may flicker until the guide"
+          " pass runs");
     }
   }
 
@@ -8649,12 +8793,11 @@ inline bool ProcessInlinePreSR(
     hdr_mode = 0;
   }
   const uint32_t requested_stack = std::clamp(stack_passes.load(), 1u, kMaxNrPasses);
-  // NR working resolution (v5.1): the same controls as the after path, with
-  // the NGX color surface as the reference - pre-SR has no separate output
-  // resolution, the game's own DLSS upscales after us.  Scaled mode runs the
-  // feature below the render resolution against the game's full-res
-  // depth/motion guides with the game's MVecScale unchanged: the same
-  // guide/color arrangement, and the same F8 rule, as the after path.
+  // NR working resolution: same scale controls as the after path.  Reference
+  // is the NGX color (render size); DLSS upscales after us.  Below 100%,
+  // guides are remeshed onto the working size and the model runs without
+  // carrying temporal history across frames (pre-SR colour is still
+  // camera-jittered; history at a smaller grid was the dark/light pulse).
   uint32_t nr_input_width = width;
   uint32_t nr_input_height = height;
   ComputeNrWorkingResolution(
@@ -8750,7 +8893,8 @@ inline bool ProcessInlinePreSR(
     return false;
   }
   FinalResources& res = *workset;
-  // Pre-SR keeps the uniform working grid (foveation is after-upscale only).
+  // Pre-SR keeps the uniform working grid (no warped density).  Guides are
+  // remeshed below when the working size is below the game's render size.
   res.foveation = {};
   res.fov_guides_valid = false;
   if (res.pre_sr_source == nullptr) {
@@ -8805,11 +8949,9 @@ inline bool ProcessInlinePreSR(
   frame.source_handle = handle;
   frame.motion = motion;
   frame.depth = depth;
-  // The guides stay at the game's render resolution even when the NR
-  // working grid is reduced: SetEvaluationParameters describes the color
-  // subrect at the working dims and the guide subrects at the full surface,
-  // and the game's MVecScale is corrected by the applied fraction (same
-  // guide/color arrangement as the after path).
+  // Guide dims are the game's render size.  When NR working size is smaller,
+  // RecordWorkingGuides resamples them onto the working surface before
+  // evaluate so Color/Depth/MVec stay the same size.
   frame.input_width = width;
   frame.input_height = height;
   frame.output_width = width;
@@ -8830,6 +8972,17 @@ inline bool ProcessInlinePreSR(
   frame.exposure_scale =
       current.exposure.scale > 0.f ? current.exposure.scale : 1.f;
   frame.feed = feed;
+
+  res.fov_guides_valid =
+      RecordWorkingGuides(command_list, device, res, frame, feature);
+  if (WorkingGuidesNeedRemesh(res, frame) && !res.fov_guides_valid) {
+    static std::atomic<bool> logged_presr_guides{false};
+    if (!logged_presr_guides.exchange(true)) {
+      Log(reshade::log::level::warning,
+          "NR pre-SR: working guides unavailable; image and motion stay"
+          " different sizes until the guide pass runs");
+    }
+  }
 
   // Stacking ping-pong (see ProcessInline): pass 0 runs NR on the game's
   // render-res color; pass k>=2 re-encodes the previous decoded result.
@@ -16288,8 +16441,9 @@ inline void DrawSectionStackingResolution(const ui::PanelText& text) {
     }
   }
   constexpr const char* kScaleTip =
-      "The working resolution as a share of the full one.  Lower costs less"
-      " GPU time.";
+      "Share of the full resolution.  Lower costs less GPU time.  Before"
+      " upscaling, a lower value also skips frame-to-frame history so"
+      " brightness does not pulse dark/light.";
   if (text.modern ? !nr_follow_input_res.load() : ui_res_mode == 2) {
     // Written LIVE on every change: the value settles through the
     // present-path contract debounce, so a drag costs exactly one rebuild
@@ -17355,72 +17509,89 @@ static_assert(std::size(kResolutionPresets) == std::size(ui::text::kResolutionLa
 // i18n: end
 #include "report_flow.hpp"
 
-// The alpha44 layout, verbatim: Developer view (UiMode=classic).
-inline void DrawClassicLayout(reshade::api::effect_runtime* runtime) {
-  const ui::PanelText& text = ui::kClassicText;
-  // Sections default to open.
-  static constexpr ImGuiTreeNodeFlags kSectionFlags = ImGuiTreeNodeFlags_DefaultOpen;
-  if (ImGui::CollapsingHeader("Neural Rendering", kSectionFlags)) {
-    DrawSectionNrCore(text);
-    if (ImGui::CollapsingHeader("Model styling (advanced)")) {
-      DrawSectionModelStyling(text);
+inline void DrawToggleHotkey(const ui::PanelText& text) {
+  const bool capturing =
+      hotkey_capture_target.load(std::memory_order_relaxed) == 1;
+  const std::string key = VirtualKeyName(static_cast<uint32_t>(kSetToggleKey.Get()));
+  ui::RowLabel(text.Pick("NR Toggle Key", "Toggle NR"), ui::text::kRebindTip);
+  const std::string shown =
+      (capturing ? std::string(ui::Tr("Press a key (Esc cancels)")) : key) + "###"
+      + kSetToggleKey.key;
+  if (ImGui::Button(shown.c_str(), ImVec2(ImGui::CalcItemWidth(), 0.f))) {
+    hotkey_capture_target = capturing ? 0 : 1;
+  }
+  ui::ItemTooltip("%s", ui::Tr(ui::text::kRebindTip));
+  if (!capturing && kSetToggleKey.Modified()
+      && ui::ResetButton(
+          kSetToggleKey.key, VirtualKeyName(static_cast<uint32_t>(kSetToggleKey.fallback)).c_str())) {
+    kSetToggleKey.Commit(kSetToggleKey.fallback);
+  }
+
+  if (capturing) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+      hotkey_capture_target = 0;
+    } else {
+      for (int key_index = ImGuiKey_NamedKey_BEGIN; key_index < ImGuiKey_NamedKey_END; ++key_index) {
+        const ImGuiKey imgui_key = static_cast<ImGuiKey>(key_index);
+        if (!ImGui::IsKeyPressed(imgui_key, false)) continue;
+        const uint32_t vk = VkFromImGuiKey(imgui_key);
+        if (vk == 0) continue;
+        toggle_hotkey = vk;
+        toggle_hotkey_was_down.store(true, std::memory_order_relaxed);
+        reshade::set_config_value(nullptr, kConfigSection, "NRToggleKey", vk);
+        hotkey_capture_target = 0;
+        break;
+      }
     }
-    if (ImGui::CollapsingHeader("Look result (advanced)")) {
-      DrawSectionLookResult(text);
-    }
   }
-  if (ImGui::CollapsingHeader("Stacking & Resolution", kSectionFlags)) {
-    DrawSectionStackingResolution(text);
-  }
-  if (ImGui::CollapsingHeader("HDR Colour Bridge", kSectionFlags)) {
-    DrawSectionCodecCombo(text);
-    DrawSectionHdrDetails(text);
-  }
-  if (DiagnosticsHeader(text)) {
-    DrawSectionGuideOverrides(text);
-    ImGui::Separator();
-    DrawSectionDiagnosticsRaw();
-    DrawSectionRestoreDefaults(runtime, text);
-  }
-  if (ImGui::CollapsingHeader("Hotkeys", kSectionFlags)) {
-    DrawSectionHotkeys(text);
-  }
-  ImGui::Separator();
-  DrawSectionLanguage(text);
-  DrawSectionLayoutToggle();
 }
 
-// i18n: begin - display strings (tools/i18n/ui_strings.py catalog)
-// The default layout (PLAN_UI_V7.md 2, reworked in alpha46 by owner
-// direction): the card answers "is it working?"; the switch, the Defaults
-// view, Strength and Resolution follow; the Look - the settings players tune
-// most - is open below them; Performance, Hotkeys, Diagnostics and Fixes
-// (HDR and guides: "only change if you know what you are doing") are
-// collapsed, one click away, never gone.  Every row is label, control, reset
-// button; every section with a changed setting offers its own reset.
-inline void DrawModernLayout(reshade::api::effect_runtime* runtime,
-                             const NrVerdict& verdict) {
-  const ui::PanelText& text = ui::kModernText;
-  // U5: under the status card until dismissed; the Developer view has none.
-  if (!ui_welcomed.load()) {
-    ImGui::PushID("welcome");  // DrawStatusCard's child id is fixed
-    if (ui::DrawStatusCard({.tone = ui::CardTone::kIdle,
-                            .glyph = ui::CardGlyph::kInfo,
-                            .title = ui::text::kWelcomeTitle,
-                            .body = ui::text::kWelcomeBody,
-                            .fix = {ui::text::kWelcomeSteps[0],
-                                    ui::text::kWelcomeSteps[1],
-                                    ui::text::kWelcomeSteps[2]},
-                            .fix_count = std::size(ui::text::kWelcomeSteps),
-                            .action = ui::CardAction::kDismiss})) {
-      ui_welcomed = true;
-      reshade::set_config_value(nullptr, kConfigSection, "UiWelcomed", true);
-    }
-    ImGui::PopID();
-    ui::SectionGap();
+inline void DrawDllSelection() {
+  static std::vector<AvailableNrDll> available_dlls = ScanAvailableNrDlls();
+  static int last_scan_frame = -1;
+  const int current_frame = ImGui::GetFrameCount();
+  if (current_frame - last_scan_frame > 300) {
+    available_dlls = ScanAvailableNrDlls();
+    last_scan_frame = current_frame;
   }
+
+  char current_saved[260] = "nvngx_dlssnr.dll";
+  size_t size = sizeof(current_saved);
+  reshade::get_config_value(nullptr, kConfigSection, "SelectedNrDll", current_saved, &size);
+
+  int selected_idx = 0;
+  for (size_t i = 0; i < static_cast<int>(available_dlls.size()); ++i) {
+    if (_stricmp(available_dlls[i].display_name.c_str(), current_saved) == 0) {
+      selected_idx = static_cast<int>(i);
+      break;
+    }
+  }
+
+  ui::RowLabel(ui::Tr("VersÃ£o da DLL"), ui::Tr("Arquivo da biblioteca nvngx_dlssnr.dll utilizado"));
+  if (ImGui::BeginCombo("##selected_nr_dll", available_dlls[selected_idx].display_name.c_str())) {
+    for (size_t i = 0; i < static_cast<int>(available_dlls.size()); ++i) {
+      const bool is_selected = (selected_idx == static_cast<int>(i));
+      if (ImGui::Selectable(available_dlls[i].display_name.c_str(), is_selected)) {
+        selected_idx = static_cast<int>(i);
+        reshade::set_config_value(nullptr, kConfigSection, "SelectedNrDll", available_dlls[i].display_name.c_str());
+      }
+      if (is_selected) ImGui::SetItemDefaultFocus();
+    }
+    ImGui::EndCombo();
+  }
+}
+
+inline void DrawCleanLayout(reshade::api::effect_runtime* runtime,
+                            const NrVerdict& verdict) {
+  const ui::PanelText& text = ui::kModernText;
+
+  // 1. Chave Ligar/Desligar e Intensidade Geral
   DrawSectionNrCore(text);
 
+  // 2. Escolha da tecla que ativa ou desativa o NR
+  DrawToggleHotkey(text);
+
+  // 3. Modo de ResoluÃ§Ã£o (Completo, Qualidade, Equilibrado, Desempenho, Igual ao jogo)
   const bool follow = nr_follow_input_res.load();
   const float scale = nr_resolution_scale.load();
   int preset = -1;
@@ -17444,69 +17615,46 @@ inline void DrawModernLayout(reshade::api::effect_runtime* runtime,
     CommitResolutionMode(chosen.mode);
   }
   ResolutionResetButton("resolution_reset");
-  if (preset < 0) {
-    ui::RowLabel("");
-    ImGui::TextDisabled(ui::Tr(ui::text::kCustomResolution), scale * 100.f);
-  }
 
-  // Same place as the older "Imagem" panel: always visible, not under Performance.
+  // 4. Barra com o ajuste da porcentagem do NR (Escala de resoluÃ§Ã£o)
+  constexpr const char* kScaleTip =
+      "The working resolution as a share of the full one.  Lower costs less GPU time.";
+  if (!nr_follow_input_res.load()) {
+    float ui_res_pct = nr_resolution_scale.load() * 100.f;
+    ui::RowLabel(ui::Tr("Resolution scale"), kScaleTip);
+    if (ui::Slider("##resolution_scale", &ui_res_pct, 33.f, 100.f, "%.0f%%", kScaleTip)) {
+      ui_res_pct = std::clamp(ui_res_pct, 33.f, 100.f);
+      const float live_scale = ui_res_pct / 100.f;
+      if (live_scale != nr_resolution_scale.load()) {
+        nr_resolution_scale = live_scale;
+        kSetResolutionScale.Persist();
+      }
+    }
+  } else {
+    ui::RowLabel(ui::Tr("Resolution scale"), kScaleTip);
+    ImGui::TextDisabled("%s", ui::Tr("follows the game (Match game)"));
+  }
+  ResolutionResetButton("resolution_scale_reset");
+
+  // 5. Escolha da VersÃ£o da DLL
+  DrawDllSelection();
+
+  // 6. Ponto de InserÃ§Ã£o (Antes do upscaling / Depois do upscaling)
   DrawInsertionPoint(text);
 
-  // A section's reset link is hidden in the Defaults view: the look is
-  // stock then, and the player's own values come back with Mine.
-  if (ui::SectionCaption(
-          ui::text::kLook, ui::text::kResetLook,
-          !ui_defaults_view && AnyModified({kLookSettings, kLookResultSettings}))) {
-    ResetSettings({kLookSettings, kLookResultSettings});
-  }
+  ui::SectionGap();
+
+  // 7. Controles Oficiais da Nvidia
   ImGui::BeginDisabled(ui_defaults_view);
   DrawSectionModelStyling(text);
-  ui::SectionGap();
-  DrawSectionLookResult(text);
   ImGui::EndDisabled();
+
   ui::SectionGap();
 
-  bool reset = false;
-  if (ui::SectionHeader(
-          ui::text::kPerformance, ui::text::kPerformanceHint, ui::text::kResetPerformance,
-          !ui_defaults_view && AnyModified({kPerformanceSettings, kStackingSettings}),
-          &reset)) {
-    DrawSectionStackingResolution(text);
-  }
-  if (reset) ResetSettings({kPerformanceSettings, kStackingSettings});
-
-  char hotkeys[128];
-  std::snprintf(hotkeys, sizeof(hotkeys), ui::Tr(ui::text::kHotkeysHint),
-                VirtualKeyName(toggle_hotkey.load()).c_str(),
-                VirtualKeyName(screenshot_hotkey.load()).c_str());
-  if (ui::SectionHeader(ui::text::kHotkeys, hotkeys, ui::text::kResetHotkeys,
-                        AnyModified({kHotkeySettings}), &reset)) {
-    DrawSectionHotkeys(text);
-  }
-  if (reset) ResetSettings({kHotkeySettings});
-
+  // 8. DiagnÃ³stico simples (retrÃ¡til)
   if (DiagnosticsHeader(text)) {
     DrawDiagnostics(verdict);
   }
-
-  if (ui::SectionHeader(ui::text::kFixes, ui::text::kFixesHint, ui::text::kResetFixes,
-                        AnyModified({kFixesSettings}), &reset)) {
-    {
-      ui::StyleScope warning;
-      warning.Color(ImGuiCol_Text, ui::tokens::kWarn);
-      ImGui::TextUnformatted(ui::icons::kWarning);
-      ImGui::SameLine();
-      ImGui::PushTextWrapPos(0.f);
-      ImGui::TextUnformatted(ui::Tr(ui::text::kFixesWarning));
-      ImGui::PopTextWrapPos();
-    }
-    ui::SubCaption(ui::text::kFixesHdr);
-    DrawSectionCodecCombo(text);
-    DrawSectionHdrDetails(text);
-    ui::SubCaption(ui::text::kFixesGuides);
-    DrawSectionGuideOverrides(text);
-  }
-  if (reset) ResetSettings({kFixesSettings});
 
   ui::SectionGap();
   DrawSectionLanguage(text);
@@ -17520,20 +17668,20 @@ inline void DrawModernLayout(reshade::api::effect_runtime* runtime,
     ImGui::PopTextWrapPos();
   }
   DrawSectionRestoreDefaults(runtime, text);
-  ui::SameLineIfFits(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x
-                     + ImGui::CalcTextSize(ui::Tr(ui::text::kDeveloperView)).x);
-  DrawSectionLayoutToggle();
+}
+
+inline void DrawClassicLayout(reshade::api::effect_runtime* runtime) {
+  const NrVerdict verdict = ComputeNrVerdict(CollectFunnelInputs());
+  DrawCleanLayout(runtime, verdict);
+}
+
+inline void DrawModernLayout(reshade::api::effect_runtime* runtime,
+                             const NrVerdict& verdict) {
+  DrawCleanLayout(runtime, verdict);
 }
 
 inline void DrawPanelBody(reshade::api::effect_runtime* runtime) {
-  // The status card comes first (PLAN_UI_V7.md 3): the one question a
-  // player opens this panel with - "is it working?" - is answered before any
-  // control.  The card is the verdict's, never a second opinion (R1): through
-  // alpha43 a ladder here printed funnel rungs, and v6.6.0 through v6.7.2
-  // said ACTIVE while every evaluate declined.  ComputeStatusCard is the
-  // same function the NR-CARD line states, and test/dlss5 pins every row.
   const NrVerdict verdict = ComputeNrVerdict(CollectFunnelInputs());
-  const bool classic = ui_classic_layout.load();
   {
     const ui::StatusCard card =
         ui::ComputeStatusCard(CollectCardInputs(verdict, SteadyNowNs()));
@@ -17547,13 +17695,6 @@ inline void DrawPanelBody(reshade::api::effect_runtime* runtime) {
       if (card.action == ui::CardAction::kTurnOn) SetNrEnabledFromUi(true);
       if (card.action == ui::CardAction::kOpenDiagnostics) ui_open_diagnostics = true;
     }
-    DrawIssueReport();
-    if (classic) {
-      ui::StyleScope footer;
-      footer.FontSize(ui::SmallFontSize())
-          .Color(ImGuiCol_Text, ui::tokens::kTextSecondary);
-      ImGui::Text(ui::text::kFooter, kAddonVersion, NrRuntimeVersionText(), GameExeName().c_str());
-    }
     if (streamline_hooks_enabled.load() && hooks_enabled.load()) {
       ImGui::PushTextWrapPos(0.f);
       ImGui::TextColored(
@@ -17564,12 +17705,10 @@ inline void DrawPanelBody(reshade::api::effect_runtime* runtime) {
     }
     ui::SectionGap();
   }
-  if (classic) {
-    DrawClassicLayout(runtime);
-  } else {
-    DrawModernLayout(runtime, verdict);
-  }
+  DrawCleanLayout(runtime, verdict);
 }
+
+
 
 // i18n: end
 

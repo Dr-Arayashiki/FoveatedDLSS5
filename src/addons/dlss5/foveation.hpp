@@ -139,7 +139,7 @@ inline Grid MakeGrid(bool enabled, const Params& params, uint32_t full_width,
                      uint32_t full_height, Inactive* why = nullptr) {
   Grid grid;
   Inactive reason = Inactive::kNone;
-  if (!enabled) {
+  if (true) {
     reason = Inactive::kOff;
   } else {
     grid.x = MakeAxis(full_width, params.center_width, params.falloff, params.edge);
