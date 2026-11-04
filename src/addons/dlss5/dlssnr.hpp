@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -17502,8 +17502,8 @@ struct ResolutionPreset {
   int mode;  // the classic combo index CommitResolutionMode logs
 };
 inline constexpr ResolutionPreset kResolutionPresets[] = {
-    {false, 1.00f, 0}, {false, 0.67f, 2}, {false, 0.58f, 2},
-    {false, 0.50f, 2}, {true, 1.00f, 1}};
+    {false, 1.00f, 0}, {false, 0.63f, 2}, {false, 0.58f, 2},
+    {false, 0.55f, 2}, {false, 0.45f, 2}, {true, 1.00f, 1}};
 static_assert(std::size(kResolutionPresets) == std::size(ui::text::kResolutionLabels));
 
 // i18n: end

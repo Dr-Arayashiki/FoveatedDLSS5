@@ -130,6 +130,8 @@ inline constexpr Translation kPtBr[] = {
      "Qualidade"},
     {"Balanced",
      "Equilibrado"},
+    {"Ultra Performance",
+     "Ultra Desempenho"},
     {"Match game",
      "Igual ao jogo"},
     {"The resolution Neural Rendering works at.  Full is the sharpest; the lower presets cost less GPU time.  Match game follows the game's own render resolution.",

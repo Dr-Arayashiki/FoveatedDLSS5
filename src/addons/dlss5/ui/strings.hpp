@@ -185,7 +185,7 @@ inline constexpr const char* kLanguageTip =
 // Performance are the working-resolution fractions of DLSS's own modes;
 // "Match game" follows the game's render resolution (NRFollowInputRes).
 inline constexpr const char* kResolutionLabels[] = {
-    "Full", "Quality", "Balanced", "Performance", "Match game"};
+    "Full", "Quality", "Balanced", "Performance", "Ultra Performance", "Match game"};
 inline constexpr const char* kResolutionTip =
     "The resolution Neural Rendering works at.  Full is the sharpest; the"
     " lower presets cost less GPU time.  Match game follows the game's own"
